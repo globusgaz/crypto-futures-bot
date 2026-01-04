@@ -1,316 +1,308 @@
 import asyncio
 import aiohttp
 import json
-from datetime import datetime
-from telegram import Bot
-from telegram.error import TelegramError
+import os
 import logging
 import hashlib
+from datetime import datetime, timezone
+
+from telegram import Bot
+from telegram.error import TelegramError
 from bs4 import BeautifulSoup
 import re
-import os
 
-# ================= НАСТРОЙКИ =================
+# ================== CONFIG ==================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CHECK_INTERVAL = 600  # 10 хв
 
+STATE_FILE = "bot_state.json"
+
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     raise RuntimeError("❌ TELEGRAM_BOT_TOKEN або TELEGRAM_CHAT_ID не задані")
 
-# ================= ЛОГИ =================
+# ================== LOGGING ==================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-STATE_FILE = "bot_state.json"
-
-# ================= STATE =================
+# ================== STATE ==================
 def load_state():
-    try:
+    if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r") as f:
             return json.load(f)
-    except:
-        return {
-            "seen_hashes": [],
-            "first_run": True,
-            "known_pairs": {
-                "bingx": [],
-                "bitget": []
-            }
-        }
+    return {
+        "sent_hashes": [],
+        "first_run": True,
+        "known_pairs": {
+            "bingx": [],
+            "bitget": []
+        },
+        "bot_start_ts": int(datetime.now(timezone.utc).timestamp())
+    }
 
 def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
 
-def gen_hash(title, date):
-    return hashlib.md5(f"{title}_{date}".encode()).hexdigest()
+def make_hash(exchange, title, date):
+    raw = f"{exchange}|{title}|{date}"
+    return hashlib.md5(raw.encode()).hexdigest()
 
-# ================= HELPERS =================
-def is_futures(title: str) -> bool:
+# ================== HELPERS ==================
+def is_listing(title):
     t = title.lower()
-    keys = [
-        "perpetual", "perp", "futures", "swap", "contract",
-        "usdt-m", "usdⓢ-m", "coin-m"
-    ]
-    return any(k in t for k in keys)
+    return any(x in t for x in ["list", "listing", "launch", "perpetual"])
 
-def is_listing(title: str) -> bool:
-    return any(k in title.lower() for k in ["list", "listing", "launch"])
+def is_delisting(title):
+    t = title.lower()
+    return any(x in t for x in ["delist", "delisting", "remove"])
 
-def is_delisting(title: str) -> bool:
-    return any(k in title.lower() for k in ["delist", "remov"])
+def is_futures(title):
+    t = title.lower()
+    return any(x in t for x in ["usdt", "perpetual", "futures", "swap"])
 
-# ================= BINANCE =================
+# ================== EXCHANGES ==================
+
+# ---------- BINANCE ----------
 async def check_binance(session):
+    url = "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query?type=1&catalogId=48&pageNo=1&pageSize=20"
+    async with session.get(url, timeout=15) as r:
+        data = await r.json()
+
     out = []
-    try:
-        url = "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query?type=1&catalogId=48&pageNo=1&pageSize=20"
-        async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as r:
-            data = await r.json()
-            arts = data["data"]["catalogs"][0]["articles"]
-            for a in arts:
-                title = a["title"]
-                if is_futures(title) and (is_listing(title) or is_delisting(title)):
-                    date = datetime.fromtimestamp(a["releaseDate"]/1000).strftime("%Y-%m-%d %H:%M")
-                    out.append({
-                        "hash": gen_hash(title, date),
-                        "title": title,
-                        "url": f"https://www.binance.com/en/support/announcement/{a['code']}",
-                        "date": date,
-                        "type": "DELISTING" if is_delisting(title) else "LISTING"
-                    })
-        logger.info(f"Binance: {len(out)}")
-    except Exception as e:
-        logger.error(f"Binance error: {e}")
+    for a in data["data"]["catalogs"][0]["articles"]:
+        title = a["title"]
+        if is_futures(title) and (is_listing(title) or is_delisting(title)):
+            ts = a["releaseDate"] // 1000
+            date = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M")
+            out.append({
+                "exchange": "BINANCE",
+                "title": title,
+                "date": date,
+                "url": f"https://www.binance.com/en/support/announcement/{a['code']}",
+                "type": "DELISTING" if is_delisting(title) else "LISTING",
+                "ts": ts
+            })
+    logger.info(f"Binance: {len(out)}")
     return out
 
-# ================= BYBIT (HYBRID) =================
+# ---------- BYBIT (API + HTML FALLBACK) ----------
 async def check_bybit(session):
     out = []
 
-    # ---- METHOD 1: API ----
+    # === API TRY ===
+    api_url = "https://api.bybit.com/v5/announcements/index?locale=en-US"
     try:
-        api_url = "https://api.bybit.com/v5/announcements/index?locale=en-US&type=new_crypto"
-        async with session.get(api_url, timeout=15) as r:
-            ct = r.headers.get("Content-Type", "")
-            if r.status == 200 and "application/json" in ct:
+        async with session.get(api_url, timeout=10) as r:
+            if r.headers.get("Content-Type", "").startswith("application/json"):
                 data = await r.json()
-                for i in data.get("result", {}).get("list", []):
-                    title = i.get("title", "")
+                for i in data["result"]["list"]:
+                    title = i["title"]
                     if is_futures(title) and (is_listing(title) or is_delisting(title)):
-                        date = datetime.fromtimestamp(i["dateTimestamp"]/1000).strftime("%Y-%m-%d %H:%M")
+                        ts = i["dateTimestamp"] // 1000
                         out.append({
-                            "hash": gen_hash(title, date),
+                            "exchange": "BYBIT",
                             "title": title,
-                            "url": i.get("url", ""),
-                            "date": date,
-                            "type": "DELISTING" if is_delisting(title) else "LISTING"
+                            "date": datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                            "url": i["url"],
+                            "type": "DELISTING" if is_delisting(title) else "LISTING",
+                            "ts": ts
                         })
-                if out:
-                    logger.info(f"Bybit(API): {len(out)}")
-                    return out
-            else:
-                logger.warning("Bybit API blocked → fallback HTML")
-    except Exception as e:
-        logger.warning(f"Bybit API error → fallback HTML ({e})")
+                logger.info(f"Bybit(API): {len(out)}")
+                return out
+    except Exception:
+        logger.warning("Bybit API blocked → fallback HTML")
 
-    # ---- METHOD 2: HTML FALLBACK ----
-    try:
-        html_url = "https://www.bybit.com/en-US/support/announcement"
-        async with session.get(html_url, headers={"User-Agent": "Mozilla/5.0"}) as r:
-            html = await r.text()
-            soup = BeautifulSoup(html, "html.parser")
-            for a in soup.find_all("a"):
-                title = a.get_text(strip=True)
-                if len(title) > 20 and is_futures(title) and (is_listing(title) or is_delisting(title)):
-                    date = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
-                    href = a.get("href", "")
-                    out.append({
-                        "hash": gen_hash(title, date),
-                        "title": title,
-                        "url": f"https://www.bybit.com{href}" if href.startswith("/") else html_url,
-                        "date": date,
-                        "type": "DELISTING" if is_delisting(title) else "LISTING"
-                    })
-        logger.info(f"Bybit(HTML): {len(out)}")
-    except Exception as e:
-        logger.error(f"Bybit HTML error: {e}")
+    # === HTML FALLBACK ===
+    html_url = "https://announcements.bybit.com/en-US/?category=derivatives"
+    async with session.get(html_url, timeout=15) as r:
+        soup = BeautifulSoup(await r.text(), "html.parser")
 
+    for a in soup.find_all("a"):
+        title = a.get_text(strip=True)
+        if is_futures(title) and (is_listing(title) or is_delisting(title)):
+            out.append({
+                "exchange": "BYBIT",
+                "title": title,
+                "date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                "url": "https://announcements.bybit.com",
+                "type": "DELISTING" if is_delisting(title) else "LISTING",
+                "ts": int(datetime.now(timezone.utc).timestamp())
+            })
+
+    logger.info(f"Bybit(HTML): {len(out)}")
     return out
 
-# ================= MEXC =================
+# ---------- MEXC ----------
 async def check_mexc(session):
+    url = "https://www.mexc.com/announcements/new-listings"
+    async with session.get(url, timeout=15) as r:
+        soup = BeautifulSoup(await r.text(), "html.parser")
+
     out = []
-    try:
-        url = "https://www.mexc.com/announcements/new-listings"
-        async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as r:
-            soup = BeautifulSoup(await r.text(), "html.parser")
-            for a in soup.find_all("a"):
-                title = a.get_text(strip=True)
-                if len(title) > 15 and is_futures(title) and (is_listing(title) or is_delisting(title)):
-                    date = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
-                    out.append({
-                        "hash": gen_hash(title, date),
-                        "title": title,
-                        "url": "https://www.mexc.com" + a.get("href", ""),
-                        "date": date,
-                        "type": "DELISTING" if is_delisting(title) else "LISTING"
-                    })
-        logger.info(f"MEXC: {len(out)}")
-    except Exception as e:
-        logger.error(f"MEXC error: {e}")
+    for a in soup.find_all("a", href=re.compile("/announcements/")):
+        title = a.get_text(strip=True)
+        if is_futures(title) and (is_listing(title) or is_delisting(title)):
+            out.append({
+                "exchange": "MEXC",
+                "title": title,
+                "date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                "url": "https://www.mexc.com" + a["href"],
+                "type": "DELISTING" if is_delisting(title) else "LISTING",
+                "ts": int(datetime.now(timezone.utc).timestamp())
+            })
+    logger.info(f"MEXC: {len(out)}")
     return out
 
-# ================= GATE =================
+# ---------- GATE ----------
 async def check_gate(session):
+    url = "https://www.gate.io/announcements"
+    async with session.get(url, timeout=15) as r:
+        soup = BeautifulSoup(await r.text(), "html.parser")
+
     out = []
-    try:
-        url = "https://www.gate.io/announcements"
-        async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as r:
-            soup = BeautifulSoup(await r.text(), "html.parser")
-            for a in soup.find_all("a"):
-                title = a.get_text(strip=True)
-                if len(title) > 20 and is_futures(title) and (is_listing(title) or is_delisting(title)):
-                    date = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
-                    out.append({
-                        "hash": gen_hash(title, date),
-                        "title": title,
-                        "url": "https://www.gate.io" + a.get("href", ""),
-                        "date": date,
-                        "type": "DELISTING" if is_delisting(title) else "LISTING"
-                    })
-        logger.info(f"Gate: {len(out)}")
-    except Exception as e:
-        logger.error(f"Gate error: {e}")
+    for a in soup.find_all("a"):
+        title = a.get_text(strip=True)
+        if is_futures(title) and (is_listing(title) or is_delisting(title)):
+            out.append({
+                "exchange": "GATE",
+                "title": title,
+                "date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                "url": "https://www.gate.io",
+                "type": "DELISTING" if is_delisting(title) else "LISTING",
+                "ts": int(datetime.now(timezone.utc).timestamp())
+            })
+    logger.info(f"Gate: {len(out)}")
     return out
 
-# ================= BINGX =================
-async def check_bingx(session, state, silent=False):
+# ---------- BINGX ----------
+async def check_bingx(session, state):
+    url = "https://open-api.bingx.com/openApi/swap/v2/quote/contracts"
+    async with session.get(url, timeout=10) as r:
+        data = await r.json()
+
+    current = [c["symbol"] for c in data["data"] if c["status"] == 1]
+    old = set(state["known_pairs"]["bingx"])
+    state["known_pairs"]["bingx"] = current
+
     out = []
-    try:
-        url = "https://open-api.bingx.com/openApi/swap/v2/quote/contracts"
-        async with session.get(url) as r:
-            data = await r.json()
-            symbols = [c["symbol"] for c in data["data"] if c["status"] == 1]
-            if silent:
-                state["known_pairs"]["bingx"] = symbols
-                return []
-            old = set(state["known_pairs"]["bingx"])
-            for s in set(symbols) - old:
-                title = f"New Listing {s} Perpetual"
-                out.append({
-                    "hash": gen_hash(title, s),
-                    "title": title,
-                    "url": "https://bingx.com",
-                    "date": datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
-                    "type": "LISTING"
-                })
-            state["known_pairs"]["bingx"] = symbols
-        logger.info(f"BingX: {len(out)}")
-    except Exception as e:
-        logger.error(f"BingX error: {e}")
+    for s in set(current) - old:
+        out.append({
+            "exchange": "BINGX",
+            "title": f"New Listing: {s} Perpetual",
+            "date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+            "url": "https://bingx.com",
+            "type": "LISTING",
+            "ts": int(datetime.now(timezone.utc).timestamp())
+        })
+    logger.info(f"BingX: {len(out)}")
     return out
 
-# ================= BITGET =================
-async def check_bitget(session, state, silent=False):
+# ---------- BITGET ----------
+async def check_bitget(session, state):
+    url = "https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES"
+    async with session.get(url, timeout=10) as r:
+        data = await r.json()
+
+    current = [t["symbol"] for t in data["data"]]
+    old = set(state["known_pairs"]["bitget"])
+    state["known_pairs"]["bitget"] = current
+
     out = []
-    try:
-        url = "https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES"
-        async with session.get(url) as r:
-            data = await r.json()
-            symbols = [d["symbol"] for d in data["data"]]
-            if silent:
-                state["known_pairs"]["bitget"] = symbols
-                return []
-            old = set(state["known_pairs"]["bitget"])
-            for s in set(symbols) - old:
-                title = f"New Listing {s} Perpetual"
-                out.append({
-                    "hash": gen_hash(title, s),
-                    "title": title,
-                    "url": "https://www.bitget.com",
-                    "date": datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
-                    "type": "LISTING"
-                })
-            state["known_pairs"]["bitget"] = symbols
-        logger.info(f"Bitget: {len(out)}")
-    except Exception as e:
-        logger.error(f"Bitget error: {e}")
+    for s in set(current) - old:
+        out.append({
+            "exchange": "BITGET",
+            "title": f"New Listing: {s} Perpetual",
+            "date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+            "url": "https://www.bitget.com",
+            "type": "LISTING",
+            "ts": int(datetime.now(timezone.utc).timestamp())
+        })
+    logger.info(f"Bitget: {len(out)}")
     return out
 
-# ================= KUCOIN =================
+# ---------- KUCOIN ----------
 async def check_kucoin(session):
+    url = "https://futures.kucoin.com/_api/v1/announcement?type=futures"
+    async with session.get(url, timeout=10) as r:
+        data = await r.json()
+
     out = []
-    try:
-        url = "https://futures.kucoin.com/_api/v1/announcement?type=futures"
-        async with session.get(url) as r:
-            data = await r.json()
-            for i in data.get("items", []):
-                title = i["title"]
-                if is_futures(title) and (is_listing(title) or is_delisting(title)):
-                    date = i["createdAt"]
-                    out.append({
-                        "hash": gen_hash(title, date),
-                        "title": title,
-                        "url": f"https://futures.kucoin.com/announcement/{i['id']}",
-                        "date": date,
-                        "type": "DELISTING" if is_delisting(title) else "LISTING"
-                    })
-        logger.info(f"KuCoin: {len(out)}")
-    except Exception as e:
-        logger.error(f"KuCoin error: {e}")
+    for a in data["items"]:
+        title = a["title"]
+        if is_futures(title) and (is_listing(title) or is_delisting(title)):
+            ts = a["createdAt"] // 1000
+            out.append({
+                "exchange": "KUCOIN",
+                "title": title,
+                "date": datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                "url": "https://futures.kucoin.com",
+                "type": "DELISTING" if is_delisting(title) else "LISTING",
+                "ts": ts
+            })
+    logger.info(f"KuCoin: {len(out)}")
     return out
 
-# ================= TELEGRAM =================
-async def send(bot, ex, ann):
-    emoji = "🆕" if ann["type"] == "LISTING" else "⚠️"
+# ================== TELEGRAM ==================
+async def send(bot, a):
+    emoji = "🆕" if a["type"] == "LISTING" else "⚠️"
     msg = (
-        f"{emoji} <b>{ex} FUTURES {ann['type']}</b>\n\n"
-        f"<b>{ann['title']}</b>\n"
-        f"{ann['date']}\n"
-        f"<a href='{ann['url']}'>Читати</a>"
+        f"{emoji} <b>{a['exchange']} FUTURES {a['type']}</b>\n\n"
+        f"<b>{a['title']}</b>\n"
+        f"{a['date']}\n"
+        f"<a href='{a['url']}'>Читати</a>"
     )
-    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="HTML", disable_web_page_preview=True)
+    await bot.send_message(
+        TELEGRAM_CHAT_ID,
+        msg,
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
 
-# ================= MAIN =================
+# ================== MAIN ==================
 async def main():
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    bot = Bot(TELEGRAM_BOT_TOKEN)
     state = load_state()
 
-    if state["first_run"]:
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🤖 Bot started")
-        async with aiohttp.ClientSession() as s:
-            await check_bingx(s, state, True)
-            await check_bitget(s, state, True)
+    logger.info("🤖 Бот запущено!")
+
+    async with aiohttp.ClientSession() as session:
+        checks = [
+            check_binance(session),
+            check_bybit(session),
+            check_mexc(session),
+            check_gate(session),
+            check_bingx(session, state),
+            check_bitget(session, state),
+            check_kucoin(session)
+        ]
+
+        results = []
+        for r in await asyncio.gather(*checks):
+            results.extend(r)
+
+        for a in results:
+            if a["ts"] < state["bot_start_ts"]:
+                continue
+
+            h = make_hash(a["exchange"], a["title"], a["date"])
+            if h in state["sent_hashes"]:
+                continue
+
+            await send(bot, a)
+            state["sent_hashes"].append(h)
+            await asyncio.sleep(1)
+
+        state["sent_hashes"] = state["sent_hashes"][-500:]
         state["first_run"] = False
         save_state(state)
 
-    while True:
-        try:
-            async with aiohttp.ClientSession() as s:
-                all_anns = (
-                    await check_binance(s)
-                    + await check_bybit(s)
-                    + await check_mexc(s)
-                    + await check_gate(s)
-                    + await check_bingx(s, state)
-                    + await check_bitget(s, state)
-                    + await check_kucoin(s)
-                )
-                for a in all_anns:
-                    if a["hash"] not in state["seen_hashes"]:
-                        await send(bot, "EXCHANGE", a)
-                        state["seen_hashes"].append(a["hash"])
-                save_state(state)
-                logger.info("✅ Check done")
-        except Exception as e:
-            logger.error(e)
-
-        await asyncio.sleep(CHECK_INTERVAL)
+    logger.info("✅ Check done")
+    await asyncio.sleep(CHECK_INTERVAL)
+    await main()
 
 if __name__ == "__main__":
     asyncio.run(main())
