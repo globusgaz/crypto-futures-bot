@@ -69,7 +69,6 @@ def is_delisting(title):
     return any(word in title_lower for word in delisting_keywords)
 
 # ================= ФУНКЦІЇ ДЛЯ БІРЖ =================
-# Всі функції взяті з твого коду, з додаванням KuCoin
 # 1. Binance
 async def check_binance(session):
     try:
