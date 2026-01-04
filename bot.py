@@ -33,7 +33,7 @@ def load_state():
             return json.load(f)
     except FileNotFoundError:
         return {
-            "seen_hashes": [], 
+            "seen_hashes": [],
             "first_run": True,
             "known_pairs": {"bitget": [], "bingx": [], "kucoin": []}
         }
@@ -94,28 +94,29 @@ async def check_binance(session):
         logger.error(f"Binance error: {e}")
     return []
 
-# 2. Bybit
+# 2. Bybit (HTML-парсер)
 async def check_bybit(session):
     try:
-        url = "https://api.bybit.com/v5/announcements/index?locale=en-US&type=new_crypto&page=1&limit=20"
-        async with session.get(url, timeout=15) as resp:
-            if resp.status == 200 and resp.headers.get('Content-Type','').startswith('application/json'):
-                data = await resp.json()
+        url = "https://www.bybit.com/en-US/announcements/"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        async with session.get(url, headers=headers, timeout=20) as resp:
+            if resp.status == 200:
+                text = await resp.text()
+                soup = BeautifulSoup(text, 'html.parser')
                 announcements = []
-                for item in data.get('result', {}).get('list', []):
-                    title = item.get('title', '')
+                for item in soup.select('a.announcement-item'):
+                    title = item.get_text(strip=True)
                     if is_futures_announcement(title) and (is_listing(title) or is_delisting(title)):
-                        date = datetime.fromtimestamp(item.get('dateTimestamp',0)/1000).strftime('%Y-%m-%d %H:%M')
+                        href = item.get('href','')
+                        date = datetime.now().strftime('%Y-%m-%d %H:%M')
                         announcements.append({
                             'hash': generate_hash(title, date),
                             'title': title,
-                            'url': item.get('url',''),
+                            'url': f"https://www.bybit.com{href}" if href.startswith('/') else href,
                             'date': date,
                             'type': 'DELISTING' if is_delisting(title) else 'LISTING'
                         })
                 return announcements
-            else:
-                logger.warning(f"Bybit skipped: unexpected Content-Type: {resp.headers.get('Content-Type','')}")
     except Exception as e:
         logger.error(f"Bybit error: {e}")
     return []
@@ -282,7 +283,7 @@ async def check_kucoin(session, state, silent=False):
         logger.error(f"KuCoin error: {e}")
     return []
 
-# ============ ВІДПРАВКА ПОВІДОМЛЕННЯ ============
+# ================= ВІДПРАВКА ПОВІДОМЛЕННЯ =================
 async def send_telegram_message(bot, exchange, announcement):
     emoji="🆕" if announcement.get('type')=='LISTING' else "⚠️"
     type_text="LISTING" if announcement.get('type')=='LISTING' else "DELISTING"
@@ -296,7 +297,7 @@ async def send_telegram_message(bot, exchange, announcement):
     except TelegramError as e:
         logger.error(f"Telegram error: {e}")
 
-# ============ ГОЛОВНА ФУНКЦІЯ ============
+# ================= ГОЛОВНА ФУНКЦІЯ =================
 async def main():
     bot=Bot(token=TELEGRAM_BOT_TOKEN)
     state=load_state()
