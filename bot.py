@@ -398,4 +398,4 @@ async def main():
                 save_state(state)
                 
                 if new_found:
-                    logger.info(f"🆕 Нов
+                    logger.info(f"🆕 Нові зміни {datetime.now().strftime('%H:%M:%S')}")
