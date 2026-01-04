@@ -1,0 +1,6 @@
+bot_state.json
+bot.log
+__pycache__/
+*.pyc
+.env
+test_*.py
