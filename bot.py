@@ -1,207 +1,120 @@
 import asyncio
-import aiohttp
-import hashlib
 import json
-import logging
 import os
-import re
-from datetime import datetime, timezone
+from datetime import datetime
+import httpx
 from bs4 import BeautifulSoup
-from telegram import Bot
 
-# ================== CONFIG ==================
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-CHECK_INTERVAL = 600
 STATE_FILE = "state.json"
+TELEGRAM_BOT = "8556578094:AAHtu6Aglmqj-n_fBXgjmCQIee3vyiegOUw"
+TELEGRAM_CHAT_ID = "@your_channel_or_chat_id"
 
-if not BOT_TOKEN or not CHAT_ID:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN або TELEGRAM_CHAT_ID не задані")
+EXCHANGES = ["binance", "bybit", "mexc", "gate", "bingx", "bitget", "kucoin"]
 
-# ================== LOG ==================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-log = logging.getLogger("bot")
-
-# ================== STATE ==================
+# ---------------- State Handling ----------------
 def load_state():
-    if not os.path.exists(STATE_FILE):
-        return {"seen": []}
-    with open(STATE_FILE, "r") as f:
+    if not os.path.exists(STATE_FILE) or os.path.getsize(STATE_FILE) == 0:
+        return {"listings": {}, "delistings": {}}
+    with open(STATE_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
 def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
 
-def make_hash(exchange, title, url):
-    return hashlib.md5(f"{exchange}|{title}|{url}".encode()).hexdigest()
+# ---------------- Telegram ----------------
+async def send_telegram(msg):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
+    async with httpx.AsyncClient() as client:
+        try:
+            await client.post(url, json=payload, timeout=10)
+        except Exception as e:
+            print("Telegram send error:", e)
 
-# ================== HELPERS ==================
-def is_futures(title: str):
-    t = title.lower()
-    return any(k in t for k in [
-        "futures", "perpetual", "perp", "usdt-m", "usdⓢ-m", "contract"
-    ])
+# ---------------- Fetch Functions ----------------
+async def fetch_binance():
+    url = "https://api.binance.com/bapi/composite/v1/public/cms/article/list/query"
+    payload = {"pageSize": 10, "pageNo": 1, "category": "FUTURES_LISTINGS"}
+    async with httpx.AsyncClient() as client:
+        try:
+            r = await client.post(url, json=payload, timeout=10)
+            if r.status_code != 200 or not r.text.strip():
+                print("Binance blocked or empty response")
+                return []
+            data = r.json()
+            return data.get("data", {}).get("articles", [])
+        except Exception as e:
+            print("Binance fetch error:", e)
+            return []
 
-def is_listing(title: str):
-    return "list" in title.lower() and "delist" not in title.lower()
+async def fetch_bybit():
+    url = "https://www.bybit.com/derivatives/futures-announcements"
+    async with httpx.AsyncClient() as client:
+        try:
+            r = await client.get(url, timeout=10)
+            if r.status_code != 200:
+                return []
+            soup = BeautifulSoup(r.text, "html.parser")
+            return [a.text.strip() for a in soup.select(".announcement-item-title")]
+        except Exception as e:
+            print("Bybit fetch error:", e)
+            return []
 
-def is_delisting(title: str):
-    return "delist" in title.lower() or "remove" in title.lower()
+async def fetch_mexc():
+    url = "https://www.mexc.com/api/v2/futures/listings"
+    async with httpx.AsyncClient() as client:
+        try:
+            r = await client.get(url, timeout=10)
+            if r.status_code != 200 or not r.text.strip():
+                return []
+            return r.json().get("data", [])
+        except Exception as e:
+            print("MEXC fetch error:", e)
+            return []
 
-# ================== BINANCE (HTML) ==================
-async def binance(session):
-    out = []
-    url = "https://www.binance.com/en/support/announcement/c-48"
-    async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as r:
-        html = await r.text()
-    soup = BeautifulSoup(html, "html.parser")
-    for a in soup.select("a[href*='/announcement/']"):
-        title = a.get_text(strip=True)
-        if not is_futures(title):
+# Stub functions for other exchanges
+async def fetch_gate(): return []
+async def fetch_bingx(): return []
+async def fetch_bitget(): return []
+async def fetch_kucoin(): return []
+
+# ---------------- Generic Checker ----------------
+async def check_exchange(name, fetch_fn, state):
+    items = await fetch_fn()
+    new_msgs = []
+
+    for item in items:
+        if isinstance(item, dict):
+            uid = item.get("symbol") or item.get("title") or str(item)
+        else:
+            uid = str(item)
+        if uid in state["listings"]:
             continue
-        link = "https://www.binance.com" + a["href"]
-        out.append(("BINANCE", title, link))
-    log.info(f"Binance: {len(out)}")
-    return out
+        state["listings"][uid] = datetime.utcnow().isoformat()
+        msg = f"🆕 {name.upper()} LISTING\n{uid}\n📅 {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
+        new_msgs.append(msg)
 
-# ================== BYBIT (API → HTML) ==================
-async def bybit(session):
-    out = []
-    api = "https://api.bybit.com/v5/announcements/index?type=new_crypto"
-    async with session.get(api) as r:
-        if r.headers.get("Content-Type", "").startswith("application/json"):
-            data = await r.json()
-            for x in data.get("result", {}).get("list", []):
-                title = x["title"]
-                if is_futures(title):
-                    out.append(("BYBIT", title, x["url"]))
-            log.info(f"Bybit API: {len(out)}")
-            return out
+    for msg in new_msgs:
+        await send_telegram(msg)
+    if new_msgs:
+        print(f"✅ {name.upper()} LISTING sent {len(new_msgs)} messages")
 
-    log.warning("Bybit API blocked → HTML")
-    html_url = "https://announcements.bybit.com/en-US/"
-    async with session.get(html_url, headers={"User-Agent": "Mozilla/5.0"}) as r:
-        soup = BeautifulSoup(await r.text(), "html.parser")
-    for a in soup.find_all("a"):
-        title = a.get_text(strip=True)
-        if is_futures(title):
-            out.append(("BYBIT", title, html_url))
-    log.info(f"Bybit HTML: {len(out)}")
-    return out
-
-# ================== MEXC ==================
-async def mexc(session):
-    out = []
-    url = "https://www.mexc.com/announcements/futures"
-    async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as r:
-        soup = BeautifulSoup(await r.text(), "html.parser")
-    for a in soup.find_all("a"):
-        title = a.get_text(strip=True)
-        if is_futures(title):
-            out.append(("MEXC", title, "https://www.mexc.com"))
-    log.info(f"MEXC: {len(out)}")
-    return out
-
-# ================== GATE ==================
-async def gate(session):
-    out = []
-    url = "https://www.gate.io/announcements"
-    async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as r:
-        soup = BeautifulSoup(await r.text(), "html.parser")
-    for a in soup.find_all("a"):
-        title = a.get_text(strip=True)
-        if is_futures(title):
-            out.append(("GATE", title, url))
-    log.info(f"Gate: {len(out)}")
-    return out
-
-# ================== BINGX ==================
-async def bingx(session):
-    out = []
-    url = "https://open-api.bingx.com/openApi/swap/v2/quote/contracts"
-    async with session.get(url) as r:
-        data = await r.json()
-    for c in data.get("data", []):
-        out.append(("BINGX", f"{c['symbol']} Perpetual", "https://bingx.com"))
-    log.info(f"BingX: {len(out)}")
-    return out
-
-# ================== BITGET ==================
-async def bitget(session):
-    out = []
-    url = "https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES"
-    async with session.get(url) as r:
-        data = await r.json()
-    for x in data.get("data", []):
-        out.append(("BITGET", f"{x['symbol']} Perpetual", "https://bitget.com"))
-    log.info(f"Bitget: {len(out)}")
-    return out
-
-# ================== KUCOIN ==================
-async def kucoin(session):
-    out = []
-    url = "https://futures.kucoin.com/announcement"
-    async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as r:
-        soup = BeautifulSoup(await r.text(), "html.parser")
-    for a in soup.find_all("a"):
-        title = a.get_text(strip=True)
-        if is_futures(title):
-            out.append(("KUCOIN", title, url))
-    log.info(f"KuCoin: {len(out)}")
-    return out
-
-# ================== TELEGRAM ==================
-async def send(bot, ex, title, url, typ):
-    emoji = "🆕" if typ == "LISTING" else "⚠️"
-    text = (
-        f"{emoji} <b>{ex} FUTURES {typ}</b>\n\n"
-        f"📰 {title}\n"
-        f"📅 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
-        f"🔗 <a href='{url}'>Читати</a>"
-    )
-    await bot.send_message(CHAT_ID, text, parse_mode="HTML", disable_web_page_preview=True)
-
-# ================== MAIN ==================
+# ---------------- Main Loop ----------------
 async def main():
-    bot = Bot(BOT_TOKEN)
     state = load_state()
-    seen = set(state["seen"])
-
-    await bot.send_message(CHAT_ID, "🤖 Бот запущено\nМоніторю 7 бірж")
-
-    async with aiohttp.ClientSession() as session:
-        sources = await asyncio.gather(
-            binance(session),
-            bybit(session),
-            mexc(session),
-            gate(session),
-            bingx(session),
-            bitget(session),
-            kucoin(session),
-        )
-
-        for src in sources:
-            for ex, title, url in src:
-                h = make_hash(ex, title, url)
-                if h in seen:
-                    continue
-
-                typ = "DELISTING" if is_delisting(title) else "LISTING"
-                await send(bot, ex, title, url, typ)
-                seen.add(h)
-                await asyncio.sleep(1)
-
-    state["seen"] = list(seen)[-2000:]
+    tasks = [
+        check_exchange("binance", fetch_binance, state),
+        check_exchange("bybit", fetch_bybit, state),
+        check_exchange("mexc", fetch_mexc, state),
+        check_exchange("gate", fetch_gate, state),
+        check_exchange("bingx", fetch_bingx, state),
+        check_exchange("bitget", fetch_bitget, state),
+        check_exchange("kucoin", fetch_kucoin, state),
+    ]
+    await asyncio.gather(*tasks)
     save_state(state)
-    log.info("✅ Check done")
-
-    while True:
-        await asyncio.sleep(CHECK_INTERVAL)
-        await main()
+    print(f"🆕 Check done {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}")
 
 if __name__ == "__main__":
     asyncio.run(main())
