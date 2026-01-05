@@ -3,192 +3,154 @@ import json
 import hashlib
 from datetime import datetime, timezone
 import httpx
-import os
 
-# ==========================
-# Налаштування
-# ==========================
-TELEGRAM_TOKEN = "ваш_telegram_bot_token"
-TELEGRAM_CHAT_ID = "ваш_chat_id"
-
+# ========== CONFIG ==========
+TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN"
+TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
 STATE_FILE = "state.json"
+CHECK_INTERVAL = 300  # секунд між перевірками
+EXCHANGES = ["Binance", "Bybit", "MEXC", "Gate.io", "BingX", "Bitget", "KuCoin"]
 
-EXCHANGES = ["binance", "bybit", "mexc", "gate", "bingx", "bitget", "kucoin"]
+# ============================
 
-# ==========================
-# Завантаження/збереження стану
-# ==========================
 def load_state():
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r") as f:
-                return json.load(f)
-        except json.JSONDecodeError:
-            return {}
-    return {}
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"hashes": []}
 
 def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
 
-# ==========================
-# Відправка повідомлень у Telegram
-# ==========================
 async def send_telegram(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     async with httpx.AsyncClient() as client:
-        await client.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message})
+        await client.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message})
 
-# ==========================
-# Утиліта для створення хешу лістингу
-# ==========================
-def listing_hash(exchange, symbol, event_type, date_str):
-    s = f"{exchange}|{symbol}|{event_type}|{date_str}"
-    return hashlib.md5(s.encode()).hexdigest()
+def make_hash(text):
+    return hashlib.md5(text.encode("utf-8")).hexdigest()
 
-# ==========================
-# Перевірка лістингів на біржах
-# ==========================
-async def check_binance(state):
-    async with httpx.AsyncClient() as client:
+async def fetch_json(url, headers=None, method="GET", data=None):
+    async with httpx.AsyncClient(timeout=10) as client:
         try:
-            # Приклад fallback, бо часто блокують
-            r = await client.get("https://www.binance.com/bapi/composite/v1/public/cms/article/list/query")
+            if method == "GET":
+                r = await client.get(url, headers=headers)
+            else:
+                r = await client.post(url, headers=headers, data=data)
             if r.status_code != 200:
-                print("Binance blocked or empty response")
-                return
-            data = r.json()
-            for item in data.get("data", {}).get("articles", []):
-                symbol = item.get("symbol")
-                event_type = item.get("event_type", "listing")
-                date_str = item.get("date")
-                h = listing_hash("binance", symbol, event_type, date_str)
-                if h not in state:
-                    message = f"🆕 BINANCE {event_type.upper()}\n{symbol} {date_str}"
-                    await send_telegram(message)
-                    state[h] = True
-        except Exception as e:
-            print(f"Binance error: {e}")
+                return None
+            return r.json()
+        except Exception:
+            return None
 
-async def check_bybit(state):
-    async with httpx.AsyncClient() as client:
-        try:
-            r = await client.get("https://api.bybit.com/v2/public/symbols")
-            data = r.json()
-            for item in data.get("result", []):
-                symbol = item.get("name")
-                event_type = "listing"
-                date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-                h = listing_hash("bybit", symbol, event_type, date_str)
-                if h not in state:
-                    message = f"🆕 BYBIT {event_type.upper()}\n{symbol} {date_str}"
-                    await send_telegram(message)
-                    state[h] = True
-        except Exception as e:
-            print(f"Bybit error: {e}")
+# ==================== EXCHANGE CHECKS ====================
 
 async def check_mexc(state):
-    async with httpx.AsyncClient() as client:
-        try:
-            r = await client.get("https://www.mexc.com/api/v2/market/futures/list")
-            data = r.json()
-            for item in data.get("data", []):
-                symbol = item.get("symbol")
-                event_type = "listing"
-                date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-                h = listing_hash("mexc", symbol, event_type, date_str)
-                if h not in state:
-                    message = f"🆕 MEXC {event_type.upper()}\n{symbol} {date_str}"
-                    await send_telegram(message)
-                    state[h] = True
-        except Exception as e:
-            print(f"MEXC error: {e}")
+    url = "https://www.mexc.com/open/api/v2/announcement/list"  # приклад API
+    data = await fetch_json(url)
+    if not data or "data" not in data:
+        return
+    for item in data["data"]:
+        text = f"🆕 MEXC {item['type'].upper()}\n{item['title']}\n📅 {item['time']}"
+        h = make_hash(text)
+        if h not in state["hashes"]:
+            await send_telegram(text)
+            state["hashes"].append(h)
+
+async def check_binance(state):
+    url = "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
+    headers = {"Content-Type": "application/json"}
+    payload = {"page":1,"rows":50,"category":"Futures_Listing"}
+    data = await fetch_json(url, headers=headers, method="POST", data=json.dumps(payload))
+    if not data or "data" not in data or "articles" not in data["data"]:
+        print("Binance blocked or empty response")
+        return
+    for item in data["data"]["articles"]:
+        text = f"🆕 Binance {item['type'].upper()}\n{item['title']}\n📅 {item['publishTime']}"
+        h = make_hash(text)
+        if h not in state["hashes"]:
+            await send_telegram(text)
+            state["hashes"].append(h)
+
+async def check_bybit(state):
+    url = "https://api.bybit.com/v2/public/announcement"  # приклад
+    data = await fetch_json(url)
+    if not data or "result" not in data:
+        return
+    for item in data["result"]:
+        text = f"🆕 Bybit {item['category'].upper()}\n{item['title']}\n📅 {item['created_at']}"
+        h = make_hash(text)
+        if h not in state["hashes"]:
+            await send_telegram(text)
+            state["hashes"].append(h)
 
 async def check_gate(state):
-    async with httpx.AsyncClient() as client:
-        try:
-            r = await client.get("https://api.gate.io/api2/1/futures/contracts")
-            data = r.json()
-            for item in data:
-                symbol = item.get("name")
-                event_type = "listing"
-                date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-                h = listing_hash("gate", symbol, event_type, date_str)
-                if h not in state:
-                    message = f"🆕 GATE {event_type.upper()}\n{symbol} {date_str}"
-                    await send_telegram(message)
-                    state[h] = True
-        except Exception as e:
-            print(f"Gate error: {e}")
+    url = "https://api.gate.io/api2/1/announcement/futures"
+    data = await fetch_json(url)
+    if not data:
+        return
+    for item in data:
+        text = f"🆕 Gate.io {item['type'].upper()}\n{item['title']}\n📅 {item['time']}"
+        h = make_hash(text)
+        if h not in state["hashes"]:
+            await send_telegram(text)
+            state["hashes"].append(h)
 
 async def check_bingx(state):
-    # Приклад
-    async with httpx.AsyncClient() as client:
-        try:
-            r = await client.get("https://bingx.com/api/v1/futures/list")
-            data = r.json()
-            for item in data.get("data", []):
-                symbol = item.get("symbol")
-                event_type = "listing"
-                date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-                h = listing_hash("bingx", symbol, event_type, date_str)
-                if h not in state:
-                    message = f"🆕 BINGX {event_type.upper()}\n{symbol} {date_str}"
-                    await send_telegram(message)
-                    state[h] = True
-        except Exception as e:
-            print(f"BingX error: {e}")
+    url = "https://www.bingx.com/api/v1/announcement/futures"
+    data = await fetch_json(url)
+    if not data:
+        return
+    for item in data.get("data", []):
+        text = f"🆕 BingX {item['type'].upper()}\n{item['title']}\n📅 {item['time']}"
+        h = make_hash(text)
+        if h not in state["hashes"]:
+            await send_telegram(text)
+            state["hashes"].append(h)
 
 async def check_bitget(state):
-    async with httpx.AsyncClient() as client:
-        try:
-            r = await client.get("https://api.bitget.com/api/futures/v1/contracts")
-            data = r.json()
-            for item in data.get("data", []):
-                symbol = item.get("symbol")
-                event_type = "listing"
-                date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-                h = listing_hash("bitget", symbol, event_type, date_str)
-                if h not in state:
-                    message = f"🆕 BITGET {event_type.upper()}\n{symbol} {date_str}"
-                    await send_telegram(message)
-                    state[h] = True
-        except Exception as e:
-            print(f"Bitget error: {e}")
+    url = "https://api.bitget.com/api/mix/v1/announcement/list"
+    data = await fetch_json(url)
+    if not data or "data" not in data:
+        return
+    for item in data["data"]:
+        text = f"🆕 Bitget {item['type'].upper()}\n{item['title']}\n📅 {item['time']}"
+        h = make_hash(text)
+        if h not in state["hashes"]:
+            await send_telegram(text)
+            state["hashes"].append(h)
 
 async def check_kucoin(state):
-    async with httpx.AsyncClient() as client:
-        try:
-            r = await client.get("https://api.kucoin.com/api/v1/contracts/active")
-            data = r.json()
-            for item in data.get("data", []):
-                symbol = item.get("symbol")
-                event_type = "listing"
-                date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-                h = listing_hash("kucoin", symbol, event_type, date_str)
-                if h not in state:
-                    message = f"🆕 KUCOIN {event_type.upper()}\n{symbol} {date_str}"
-                    await send_telegram(message)
-                    state[h] = True
-        except Exception as e:
-            print(f"KuCoin error: {e}")
+    url = "https://api.kucoin.com/api/v1/announcement/futures"
+    data = await fetch_json(url)
+    if not data or "items" not in data:
+        return
+    for item in data["items"]:
+        text = f"🆕 KuCoin {item['type'].upper()}\n{item['title']}\n📅 {item['publishTime']}"
+        h = make_hash(text)
+        if h not in state["hashes"]:
+            await send_telegram(text)
+            state["hashes"].append(h)
 
-# ==========================
-# Основна функція
-# ==========================
+# ==================== MAIN LOOP ====================
+
 async def main():
-    state = load_state()
-    await asyncio.gather(
-        check_binance(state),
-        check_bybit(state),
-        check_mexc(state),
-        check_gate(state),
-        check_bingx(state),
-        check_bitget(state),
-        check_kucoin(state),
-    )
-    save_state(state)
-    print(f"🆕 Check done {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}")
+    while True:
+        state = load_state()
+        await asyncio.gather(
+            check_binance(state),
+            check_bybit(state),
+            check_mexc(state),
+            check_gate(state),
+            check_bingx(state),
+            check_bitget(state),
+            check_kucoin(state)
+        )
+        save_state(state)
+        print(f"🆕 Check done {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}")
+        await asyncio.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
     asyncio.run(main())
